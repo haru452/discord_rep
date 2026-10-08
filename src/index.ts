@@ -7,11 +7,15 @@ type Bindings = {
   GEMINI_API_KEY: string
   YOUTUBE_API_KEY: string
   GEMINI_MODEL?: string // 省略時は gemini-3.8-flash
+  GEMINI_FALLBACK_MODEL?: string // 混雑時の代替。省略時は gemini-flash-latest
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
 
 const DEFAULT_MODEL = 'gemini-3.8-flash'
+const DEFAULT_FALLBACK_MODEL = 'gemini-flash-latest'
+const RETRY_STATUSES = [429, 500, 503] // 再試行する一時的エラー
+const RETRY_DELAYS_MS = [1500, 3000] // 待ち時間（最大3回試行）
 const DISCORD_LIMIT = 2000
 const MAX_INPUT_LENGTH = 1000
 const MAX_RESULTS = 3 // /search: 返す動画の最大数
@@ -80,7 +84,8 @@ app.post('/interactions', async (c) => {
           interaction.application_id,
           text,
           c.env.GEMINI_API_KEY,
-          c.env.GEMINI_MODEL || DEFAULT_MODEL
+          c.env.GEMINI_MODEL || DEFAULT_MODEL,
+          c.env.GEMINI_FALLBACK_MODEL || DEFAULT_FALLBACK_MODEL
         )
       )
       return c.json({ type: 5 }) // 「考え中...」
@@ -112,31 +117,35 @@ async function handleCheck(
   appId: string,
   text: string,
   apiKey: string,
-  model: string
+  model: string,
+  fallbackModel: string
 ) {
   const followUpUrl = `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`
 
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-          contents: [{ role: 'user', parts: [{ text: `<sentence>${text}</sentence>` }] }],
-          generationConfig: { temperature: 0.3 },
-        }),
-      }
-    )
+    const payload = JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [{ role: 'user', parts: [{ text: `<sentence>${text}</sentence>` }] }],
+      generationConfig: { temperature: 0.3 },
+    })
+
+    // まず指定モデルで再試行つきで呼び、だめなら代替モデルで呼ぶ
+    let res = await callGemini(model, apiKey, payload)
+    if (!res.ok && RETRY_STATUSES.includes(res.status) && fallbackModel && fallbackModel !== model) {
+      console.warn(`Gemini ${model} failed (${res.status}); falling back to ${fallbackModel}`)
+      res = await callGemini(fallbackModel, apiKey, payload)
+    }
 
     if (!res.ok) {
       const detail = (await res.text()).slice(0, 300)
       console.error('Gemini error', res.status, detail)
-      await sendFollowUp(followUpUrl, `Gemini APIエラー (${res.status})\n\`\`\`${detail}\`\`\``)
+      const busy = RETRY_STATUSES.includes(res.status)
+      await sendFollowUp(
+        followUpUrl,
+        busy
+          ? `Geminiが混雑しています。少し待ってからもう一度お試しください。(${res.status})`
+          : `Gemini APIエラー (${res.status})\n\`\`\`${detail}\`\`\``
+      )
       return
     }
 
@@ -161,6 +170,26 @@ async function handleCheck(
     console.error(error)
     await sendFollowUp(followUpUrl, '処理中にエラーが発生しました。')
   }
+}
+
+// 一時的なエラー(429/500/503)のときだけ、待ってから再試行する
+async function callGemini(model: string, apiKey: string, payload: string): Promise<Response> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`
+  let res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+    body: payload,
+  })
+  for (const delay of RETRY_DELAYS_MS) {
+    if (res.ok || !RETRY_STATUSES.includes(res.status)) break
+    await new Promise((r) => setTimeout(r, delay))
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: payload,
+    })
+  }
+  return res
 }
 
 // ---------------------------------------------------------------
