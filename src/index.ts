@@ -89,6 +89,9 @@ async function handleSearch(token: string, appId: string, word: string, apiKey: 
     const searchRegex = new RegExp(`\\b${escapeRegExp(word)}\\b`, 'i')
     const highlightRegex = new RegExp(`(${escapeRegExp(word)})`, 'gi')
     const results: string[] = []
+    let failed = 0 // 字幕取得に失敗した動画数
+    let noMatch = 0 // 字幕はあったが単語を含まなかった動画数
+    let firstError = ''
 
     for (const item of items) {
       if (results.length >= MAX_RESULTS) break
@@ -99,6 +102,12 @@ async function handleSearch(token: string, appId: string, word: string, apiKey: 
 
       try {
         const captions = await getSubtitles({ videoID: videoId, lang: 'en' })
+        if (!captions || captions.length === 0) {
+          failed++
+          firstError ||= '字幕が空でした'
+          continue
+        }
+        let matched = false
 
         for (let i = 0; i < captions.length; i++) {
           const entry = captions[i]
@@ -112,9 +121,14 @@ async function handleSearch(token: string, appId: string, word: string, apiKey: 
           const startTime = Math.floor(parseFloat(entry.start))
 
           results.push(`🎬 **${title}**\n${context}\n🔗 ${url}&t=${startTime}s`)
+          matched = true
           break // 1動画につき1例
         }
-      } catch {
+        if (!matched) noMatch++
+      } catch (err) {
+        failed++
+        firstError ||= String(err).slice(0, 150)
+        console.error(`caption error (${videoId}):`, err)
         continue // 字幕取得失敗の動画はスキップ
       }
     }
@@ -122,7 +136,12 @@ async function handleSearch(token: string, appId: string, word: string, apiKey: 
     if (results.length > 0) {
       await sendFollowUp(followUpUrl, truncate(results.join('\n\n')))
     } else {
-      await sendFollowUp(followUpUrl, `'${word}' を含む字幕付き動画は見つかりませんでした。`)
+      await sendFollowUp(
+        followUpUrl,
+        `'${word}' を含む字幕付き動画は見つかりませんでした。\n` +
+          `（診断: 候補${items.length}件 / 字幕取得失敗${failed}件 / 字幕あり・単語なし${noMatch}件）` +
+          (firstError ? `\n最初のエラー: ${firstError}` : '')
+      )
     }
   } catch (error) {
     console.error(error)
